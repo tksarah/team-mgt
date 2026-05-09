@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "\u6d3b\u52d5\u30fb\u9032\u6357\u7ba1\u7406",
+  "version": "1.0.0-beta.1",
+  "identifier": "local.team-mgt.desktop",
+  "build": {
+    "beforeDevCommand": "npm.cmd run dev",
+    "beforeBuildCommand": "npm.cmd run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "\u6d3b\u52d5\u30fb\u9032\u6357\u7ba1\u7406",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1080,
+        "minHeight": 700
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "team-mgt",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

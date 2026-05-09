@@ -1,0 +1,26 @@
+# Node.js / Vite
+node_modules/
+dist/
+dist-ssr/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Tauri / Rust build outputs
+src-tauri/target/
+src-tauri/gen/
+
+# Portable build artifacts
+portable/*.exe
+
+# OS files
+Thumbs.db
+.DS_Store
