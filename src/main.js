@@ -6,6 +6,7 @@ const activityInputEl = document.querySelector("#activity-input");
 const progressInputEl = document.querySelector("#progress-input");
 const activityListEl = document.querySelector("#activity-list");
 const emptyMsgEl = document.querySelector("#empty-msg");
+const ID_KEY = "team-mgt.next-id";
 
 let activities = loadActivities();
 
@@ -30,6 +31,14 @@ function loadActivities() {
 
 function saveActivities() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(activities));
+}
+
+function nextId() {
+  const raw = localStorage.getItem(ID_KEY);
+  const current = Number(raw);
+  const next = Number.isInteger(current) && current >= 0 ? current + 1 : 1;
+  localStorage.setItem(ID_KEY, String(next));
+  return next;
 }
 
 function createActivityItem(item) {
@@ -114,7 +123,7 @@ formEl.addEventListener("submit", (event) => {
   }
 
   activities.push({
-    id: Date.now() + Math.floor(Math.random() * 1000),
+    id: nextId(),
     team,
     activity,
     progress: Math.trunc(progress),
