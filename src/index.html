@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>チーム活動・進捗管理</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <main class="container">
+      <h1>チーム活動・進捗管理</h1>
+
+      <form id="activity-form" class="activity-form">
+        <label>
+          チーム名
+          <input id="team-input" required maxlength="40" placeholder="例: 開発チーム" />
+        </label>
+        <label>
+          活動内容
+          <input id="activity-input" required maxlength="120" placeholder="例: リリース準備" />
+        </label>
+        <label>
+          進捗(%)
+          <input id="progress-input" type="number" min="0" max="100" value="0" required />
+        </label>
+        <button type="submit">活動を追加</button>
+      </form>
+
+      <p id="empty-msg" class="empty-msg">登録された活動はありません。</p>
+      <ul id="activity-list" class="activity-list"></ul>
+    </main>
+  </body>
+</html>
