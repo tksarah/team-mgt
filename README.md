@@ -1,4 +1,5 @@
 # Team Progress Manager β1.2
+<img width="1455" height="1314" alt="image" src="https://github.com/user-attachments/assets/52251960-4838-444b-9c29-158a0e50dde5" />
 
 Team Progress Manager は、チームで共有しながら活動・進捗を管理するための Windows デスクトップアプリです。Tauri を使ったポータブル構成で、一覧表ベースの扱いやすい UI と、共有フォルダ運用を意識した編集ロック機能を備えています。
 
