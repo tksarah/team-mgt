@@ -4,6 +4,7 @@ use rusqlite::{params, Connection};
 use rust_xlsxwriter::{Workbook, XlsxError};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -12,6 +13,12 @@ use std::{
 };
 use tauri::{Manager, State, WindowEvent};
 use thiserror::Error;
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE},
+    System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+};
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -96,6 +103,32 @@ struct ImportReport {
     imported_tasks: usize,
     imported_masters: usize,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RawTaskImport {
+    row_no: usize,
+    id: String,
+    name: String,
+    category_name: String,
+    category_id: String,
+    assignee_names: String,
+    assignee_ids: String,
+    status_name: String,
+    status_id: String,
+    dependency_names: String,
+    dependency_ids: String,
+    priority_name: String,
+    priority_id: String,
+    start_date: String,
+    due_date: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTaskImport {
+    row_no: usize,
+    task: Task,
 }
 
 pub fn run() {
@@ -447,6 +480,11 @@ fn read_app_data_for_storage(storage: &AppStorage) -> AppResult<AppData> {
 }
 
 fn validate_task(path: &Path, task: &Task) -> AppResult<()> {
+    let data = read_app_data(path)?;
+    validate_task_against_tasks(&data.tasks, task)
+}
+
+fn validate_task_against_tasks(existing_tasks: &[Task], task: &Task) -> AppResult<()> {
     if task.name.trim().is_empty()
         || task.category_id.trim().is_empty()
         || task.assignee_ids.is_empty()
@@ -457,19 +495,90 @@ fn validate_task(path: &Path, task: &Task) -> AppResult<()> {
     {
         return Err(AppError::Message("必須項目をすべて入力してください。".into()));
     }
+    if task.dependency_task_ids.len() > 1 {
+        return Err(AppError::Message("依存タスクは1件までにしてください。".into()));
+    }
     if task.start_date > task.due_date {
         return Err(AppError::Message("開始日は期日以前にしてください。".into()));
     }
     if task.dependency_task_ids.iter().any(|id| id == &task.id) {
         return Err(AppError::Message("自分自身を依存タスクにはできません。".into()));
     }
-    let data = read_app_data(path)?;
     for id in &task.dependency_task_ids {
-        if !data.tasks.iter().any(|candidate| &candidate.id == id) {
+        if !existing_tasks.iter().any(|candidate| &candidate.id == id) {
             return Err(AppError::Message(format!("依存タスクが見つかりません: {id}")));
         }
     }
+    ensure_no_dependency_cycle(existing_tasks, task)?;
     Ok(())
+}
+
+fn ensure_no_dependency_cycle(existing_tasks: &[Task], task: &Task) -> AppResult<()> {
+    let mut dependency_map = existing_tasks
+        .iter()
+        .map(|candidate| (candidate.id.clone(), candidate.dependency_task_ids.clone()))
+        .collect::<HashMap<_, _>>();
+    dependency_map.insert(task.id.clone(), task.dependency_task_ids.clone());
+
+    let mut task_names = existing_tasks
+        .iter()
+        .map(|candidate| (candidate.id.clone(), candidate.name.clone()))
+        .collect::<HashMap<_, _>>();
+    task_names.insert(task.id.clone(), task.name.clone());
+
+    let mut visit_states = HashMap::new();
+    let mut stack = Vec::new();
+
+    for task_id in dependency_map.keys() {
+        if visit_states.get(task_id).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        if let Some(cycle) = detect_dependency_cycle(task_id, &dependency_map, &mut visit_states, &mut stack) {
+            let labels = cycle
+                .iter()
+                .map(|id| task_names.get(id).cloned().unwrap_or_else(|| id.clone()))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            return Err(AppError::Message(format!("依存タスクに循環があります: {labels}")));
+        }
+    }
+
+    Ok(())
+}
+
+fn detect_dependency_cycle(
+    task_id: &str,
+    dependency_map: &HashMap<String, Vec<String>>,
+    visit_states: &mut HashMap<String, u8>,
+    stack: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    visit_states.insert(task_id.to_string(), 1);
+    stack.push(task_id.to_string());
+
+    if let Some(dependency_ids) = dependency_map.get(task_id) {
+        for dependency_id in dependency_ids {
+            match visit_states.get(dependency_id).copied().unwrap_or(0) {
+                0 => {
+                    if let Some(cycle) = detect_dependency_cycle(dependency_id, dependency_map, visit_states, stack) {
+                        return Some(cycle);
+                    }
+                }
+                1 => {
+                    if let Some(index) = stack.iter().position(|id| id == dependency_id) {
+                        let mut cycle = stack[index..].to_vec();
+                        cycle.push(dependency_id.clone());
+                        return Some(cycle);
+                    }
+                    return Some(vec![task_id.to_string(), dependency_id.clone()]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    stack.pop();
+    visit_states.insert(task_id.to_string(), 2);
+    None
 }
 
 fn require_own_lock(storage: &AppStorage) -> AppResult<()> {
@@ -506,7 +615,64 @@ fn read_lock(database_path: &Path) -> AppResult<Option<LockState>> {
         return Ok(None);
     }
     let text = fs::read_to_string(path)?;
-    Ok(Some(serde_json::from_str(&text)?))
+    let lock: LockState = serde_json::from_str(&text)?;
+    if is_stale_lock(&lock) {
+        fs::remove_file(lock_path(database_path))?;
+        return Ok(None);
+    }
+    Ok(Some(lock))
+}
+
+fn is_stale_lock(lock: &LockState) -> bool {
+    if lock.machine.trim().is_empty() {
+        return false;
+    }
+
+    let current_machine = hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if !current_machine.eq_ignore_ascii_case(&lock.machine) {
+        return false;
+    }
+
+    let Some(token) = lock.token.as_deref() else {
+        return false;
+    };
+    let Some(pid) = parse_lock_pid(token) else {
+        return false;
+    };
+
+    !is_process_running(pid)
+}
+
+fn parse_lock_pid(token: &str) -> Option<u32> {
+    token.split_once('-')?.0.parse().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn is_process_running(pid: u32) -> bool {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+
+        let mut exit_code = 0;
+        let result = GetExitCodeProcess(process, &mut exit_code);
+        CloseHandle(process);
+
+        if result == 0 {
+            return true;
+        }
+
+        exit_code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_process_running(_pid: u32) -> bool {
+    true
 }
 
 fn new_id(prefix: &str) -> String {
@@ -542,11 +708,89 @@ fn master_ids_by_names(masters: &[MasterItem], kind: &str, names: &str) -> Vec<S
         .collect()
 }
 
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn resolve_master_ids(masters: &[MasterItem], kind: &str, backup_ids: &str, backup_names: &str) -> Vec<String> {
+    let explicit_ids = split_csv(backup_ids);
+    if !explicit_ids.is_empty() {
+        return explicit_ids;
+    }
+    master_ids_by_names(masters, kind, backup_names)
+}
+
+fn resolve_dependency_ids(
+    backup_ids: &str,
+    backup_names: &str,
+    imported_name_to_id: &HashMap<String, String>,
+    existing_name_to_id: &HashMap<String, String>,
+) -> Vec<String> {
+    let explicit_ids = split_csv(backup_ids);
+    if !explicit_ids.is_empty() {
+        return explicit_ids;
+    }
+
+    split_csv(backup_names)
+        .into_iter()
+        .filter_map(|name| {
+            imported_name_to_id
+                .get(&name)
+                .cloned()
+                .or_else(|| existing_name_to_id.get(&name).cloned())
+        })
+        .collect()
+}
+
+fn upsert_task_record(conn: &Connection, task: &Task) -> AppResult<()> {
+    conn.execute(
+        "insert into tasks (id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         on conflict(id) do update set name=excluded.name, category_id=excluded.category_id, assignee_ids=excluded.assignee_ids, status_id=excluded.status_id, priority_id=excluded.priority_id, start_date=excluded.start_date, due_date=excluded.due_date, dependency_task_ids=excluded.dependency_task_ids, notes=excluded.notes, updated_at=excluded.updated_at",
+        params![
+            task.id,
+            task.name,
+            task.category_id,
+            serde_json::to_string(&task.assignee_ids)?,
+            task.status_id,
+            task.priority_id,
+            task.start_date,
+            task.due_date,
+            serde_json::to_string(&task.dependency_task_ids)?,
+            task.notes,
+            task.created_at,
+            task.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
 fn write_excel(path: &Path, tasks: &[Task], masters: &[MasterItem]) -> AppResult<()> {
     let mut workbook = Workbook::new();
     let task_sheet = workbook.add_worksheet();
     task_sheet.set_name("タスク")?;
-    let headers = ["ID", "タスク名", "カテゴリ", "担当者", "ステータス", "依存タスク", "優先度", "開始日", "期日", "メモ"];
+    let headers = [
+        "ID",
+        "タスク名",
+        "カテゴリ",
+        "カテゴリID",
+        "担当者",
+        "担当者ID",
+        "ステータス",
+        "ステータスID",
+        "依存タスク",
+        "依存タスクID",
+        "優先度",
+        "優先度ID",
+        "開始日",
+        "期日",
+        "メモ"
+    ];
     for (col, header) in headers.iter().enumerate() {
         task_sheet.write_string(0, col as u16, *header)?;
     }
@@ -565,16 +809,23 @@ fn write_excel(path: &Path, tasks: &[Task], masters: &[MasterItem]) -> AppResult
             .map(|task| task.name.clone())
             .collect::<Vec<_>>()
             .join(", ");
+        let dependency_ids = task.dependency_task_ids.join(", ");
+        let assignee_ids = task.assignee_ids.join(", ");
         task_sheet.write_string(row, 0, &task.id)?;
         task_sheet.write_string(row, 1, &task.name)?;
         task_sheet.write_string(row, 2, master_name(masters, &task.category_id))?;
-        task_sheet.write_string(row, 3, assignees)?;
-        task_sheet.write_string(row, 4, master_name(masters, &task.status_id))?;
-        task_sheet.write_string(row, 5, dependencies)?;
-        task_sheet.write_string(row, 6, master_name(masters, &task.priority_id))?;
-        task_sheet.write_string(row, 7, &task.start_date)?;
-        task_sheet.write_string(row, 8, &task.due_date)?;
-        task_sheet.write_string(row, 9, &task.notes)?;
+        task_sheet.write_string(row, 3, &task.category_id)?;
+        task_sheet.write_string(row, 4, assignees)?;
+        task_sheet.write_string(row, 5, assignee_ids)?;
+        task_sheet.write_string(row, 6, master_name(masters, &task.status_id))?;
+        task_sheet.write_string(row, 7, &task.status_id)?;
+        task_sheet.write_string(row, 8, dependencies)?;
+        task_sheet.write_string(row, 9, dependency_ids)?;
+        task_sheet.write_string(row, 10, master_name(masters, &task.priority_id))?;
+        task_sheet.write_string(row, 11, &task.priority_id)?;
+        task_sheet.write_string(row, 12, &task.start_date)?;
+        task_sheet.write_string(row, 13, &task.due_date)?;
+        task_sheet.write_string(row, 14, &task.notes)?;
     }
 
     let master_sheet = workbook.add_worksheet();
@@ -627,68 +878,144 @@ fn import_excel_file(path: &Path, database_path: &Path) -> AppResult<ImportRepor
 
     let data = read_app_data(database_path)?;
     if let Ok(range) = workbook.worksheet_range("タスク") {
-        for (idx, row) in range.rows().enumerate().skip(1) {
-            let row_no = idx + 1;
-            let id = cell(row, 0).unwrap_or_else(|| new_id("task"));
-            let name = cell(row, 1).unwrap_or_default();
-            let category_name = cell(row, 2).unwrap_or_default();
-            let assignee_names = cell(row, 3).unwrap_or_default();
-            let status_name = cell(row, 4).unwrap_or_default();
-            let dependency_names = cell(row, 5).unwrap_or_default();
-            let priority_name = cell(row, 6).unwrap_or_default();
-            let start_date = cell(row, 7).unwrap_or_default();
-            let due_date = cell(row, 8).unwrap_or_default();
-            let notes = cell(row, 9).unwrap_or_default();
+        let raw_tasks = range
+            .rows()
+            .enumerate()
+            .skip(1)
+            .map(|(idx, row)| RawTaskImport {
+                row_no: idx + 1,
+                id: cell(row, 0).unwrap_or_else(|| new_id("task")),
+                name: cell(row, 1).unwrap_or_default(),
+                category_name: cell(row, 2).unwrap_or_default(),
+                category_id: cell(row, 3).unwrap_or_default(),
+                assignee_names: cell(row, 4).unwrap_or_default(),
+                assignee_ids: cell(row, 5).unwrap_or_default(),
+                status_name: cell(row, 6).unwrap_or_default(),
+                status_id: cell(row, 7).unwrap_or_default(),
+                dependency_names: cell(row, 8).unwrap_or_default(),
+                dependency_ids: cell(row, 9).unwrap_or_default(),
+                priority_name: cell(row, 10).unwrap_or_default(),
+                priority_id: cell(row, 11).unwrap_or_default(),
+                start_date: cell(row, 12).unwrap_or_default(),
+                due_date: cell(row, 13).unwrap_or_default(),
+                notes: cell(row, 14).unwrap_or_else(|| cell(row, 9).unwrap_or_default()),
+            })
+            .collect::<Vec<_>>();
 
-            let category_id = master_ids_by_names(&data.masters, "category", &category_name).first().cloned().unwrap_or_default();
-            let assignee_ids = master_ids_by_names(&data.masters, "assignee", &assignee_names);
-            let status_id = master_ids_by_names(&data.masters, "status", &status_name).first().cloned().unwrap_or_default();
-            let priority_id = master_ids_by_names(&data.masters, "priority", &priority_name).first().cloned().unwrap_or_default();
-            let dependency_task_ids = dependency_names
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .filter_map(|task_name| data.tasks.iter().find(|task| task.name == task_name).map(|task| task.id.clone()))
-                .collect::<Vec<_>>();
+        let imported_name_to_id = raw_tasks
+            .iter()
+            .filter(|row| !row.name.trim().is_empty())
+            .map(|row| (row.name.clone(), row.id.clone()))
+            .collect::<HashMap<_, _>>();
+        let existing_name_to_id = data
+            .tasks
+            .iter()
+            .map(|task| (task.name.clone(), task.id.clone()))
+            .collect::<HashMap<_, _>>();
 
-            let task = Task {
-                id,
-                name,
-                category_id,
-                assignee_ids,
-                status_id,
-                priority_id,
-                start_date,
-                due_date,
-                dependency_task_ids,
-                notes,
-                created_at: Utc::now().to_rfc3339(),
-                updated_at: Utc::now().to_rfc3339(),
-            };
-            if let Err(err) = validate_task(database_path, &task) {
-                errors.push(format!("タスク {row_no} 行目: {err}"));
-                continue;
+        let mut pending_tasks = raw_tasks
+            .into_iter()
+            .map(|row| {
+                let category_id = resolve_master_ids(&data.masters, "category", &row.category_id, &row.category_name)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let assignee_ids = resolve_master_ids(&data.masters, "assignee", &row.assignee_ids, &row.assignee_names);
+                let status_id = resolve_master_ids(&data.masters, "status", &row.status_id, &row.status_name)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let priority_id = resolve_master_ids(&data.masters, "priority", &row.priority_id, &row.priority_name)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let dependency_task_ids = resolve_dependency_ids(
+                    &row.dependency_ids,
+                    &row.dependency_names,
+                    &imported_name_to_id,
+                    &existing_name_to_id,
+                );
+
+                PendingTaskImport {
+                    row_no: row.row_no,
+                    task: Task {
+                        id: row.id,
+                        name: row.name,
+                        category_id,
+                        assignee_ids,
+                        status_id,
+                        priority_id,
+                        start_date: row.start_date,
+                        due_date: row.due_date,
+                        dependency_task_ids,
+                        notes: row.notes,
+                        created_at: Utc::now().to_rfc3339(),
+                        updated_at: Utc::now().to_rfc3339(),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut available_tasks = data.tasks.clone();
+        while !pending_tasks.is_empty() {
+            let available_ids = available_tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<HashSet<_>>();
+            let mut next_pending = Vec::new();
+            let mut progressed = false;
+
+            for pending in pending_tasks.into_iter() {
+                if pending
+                    .task
+                    .dependency_task_ids
+                    .iter()
+                    .any(|id| !available_ids.contains(id) && id != &pending.task.id)
+                {
+                    next_pending.push(pending);
+                    continue;
+                }
+
+                let validation_tasks = available_tasks
+                    .iter()
+                    .filter(|task| task.id != pending.task.id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Err(err) = validate_task_against_tasks(&validation_tasks, &pending.task) {
+                    errors.push(format!("タスク {} 行目: {err}", pending.row_no));
+                    continue;
+                }
+
+                upsert_task_record(&conn, &pending.task)?;
+                available_tasks.retain(|task| task.id != pending.task.id);
+                available_tasks.push(pending.task);
+                imported_tasks += 1;
+                progressed = true;
             }
-            conn.execute(
-                "insert into tasks (id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 on conflict(id) do update set name=excluded.name, category_id=excluded.category_id, assignee_ids=excluded.assignee_ids, status_id=excluded.status_id, priority_id=excluded.priority_id, start_date=excluded.start_date, due_date=excluded.due_date, dependency_task_ids=excluded.dependency_task_ids, notes=excluded.notes, updated_at=excluded.updated_at",
-                params![
-                    task.id,
-                    task.name,
-                    task.category_id,
-                    serde_json::to_string(&task.assignee_ids)?,
-                    task.status_id,
-                    task.priority_id,
-                    task.start_date,
-                    task.due_date,
-                    serde_json::to_string(&task.dependency_task_ids)?,
-                    task.notes,
-                    task.created_at,
-                    task.updated_at
-                ],
-            )?;
-            imported_tasks += 1;
+
+            if next_pending.is_empty() {
+                break;
+            }
+
+            if !progressed {
+                for pending in next_pending {
+                    let missing = pending
+                        .task
+                        .dependency_task_ids
+                        .iter()
+                        .filter(|id| !available_tasks.iter().any(|task| &task.id == *id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if missing.is_empty() {
+                        errors.push(format!("タスク {} 行目: 依存タスクの循環または不整合を解決できませんでした。", pending.row_no));
+                    } else {
+                        errors.push(format!("タスク {} 行目: 依存タスクを解決できません: {}", pending.row_no, missing.join(", ")));
+                    }
+                }
+                break;
+            }
+
+            pending_tasks = next_pending;
         }
     } else {
         errors.push("タスク シートが見つかりません。".into());
