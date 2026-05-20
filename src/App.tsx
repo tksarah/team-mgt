@@ -1,4 +1,4 @@
-import { memo, type CSSProperties, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, type CSSProperties, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
@@ -49,13 +49,6 @@ type ImportReport = {
   errors: string[];
 };
 
-type TaskTreeRow = {
-  task: Task;
-  depth: number;
-  hasChildren: boolean;
-  isExpanded: boolean;
-};
-
 type TaskEditorProps = {
   editingTask: Task;
   isEditing: boolean;
@@ -79,7 +72,7 @@ type TaskTableProps = {
   statusFilter: string;
   categoryOptions: MasterItem[];
   statusOptions: MasterItem[];
-  taskTreeRows: TaskTreeRow[];
+  tasks: Task[];
   isEditing: boolean;
   masterName: (id: string) => string;
   getMasterColor: (id: string) => string;
@@ -87,7 +80,6 @@ type TaskTableProps = {
   onSetQuery: (value: string) => void;
   onSetCategoryFilter: (value: string) => void;
   onSetStatusFilter: (value: string) => void;
-  onToggleExpanded: (taskId: string, nextExpanded: boolean) => void;
   onEditTask: (task: Task) => void;
   onDeleteTask: (taskId: string) => void;
 };
@@ -104,6 +96,12 @@ type MasterTableProps = {
   isEditing: boolean;
   onSelectMaster: (master: MasterItem) => void;
   onDeleteMaster: (id: string) => void;
+};
+
+type DependencyMapProps = {
+  tasks: Task[];
+  masterName: (id: string) => string;
+  getMasterColor: (id: string) => string;
 };
 
 const blankTask = (): Task => ({
@@ -206,7 +204,7 @@ const TaskTable = memo(function TaskTable({
   statusFilter,
   categoryOptions,
   statusOptions,
-  taskTreeRows,
+  tasks,
   isEditing,
   masterName,
   getMasterColor,
@@ -214,7 +212,6 @@ const TaskTable = memo(function TaskTable({
   onSetQuery,
   onSetCategoryFilter,
   onSetStatusFilter,
-  onToggleExpanded,
   onEditTask,
   onDeleteTask
 }: TaskTableProps) {
@@ -228,27 +225,10 @@ const TaskTable = memo(function TaskTable({
       <table>
         <thead><tr><th>タスク名</th><th>カテゴリ</th><th>担当者</th><th>ステータス</th><th>優先度</th><th>期間</th><th>メモ</th><th>依存</th><th></th></tr></thead>
         <tbody>
-          {taskTreeRows.map(({ task, depth, hasChildren, isExpanded }) => (
-            <tr
-              key={task.id}
-              className={`tree-row${hasChildren ? " tree-row-parent" : ""}${isExpanded ? " tree-row-expanded" : ""}`}
-            >
+          {tasks.map((task) => (
+            <tr key={task.id}>
               <td>
-                <div className="tree-cell">
-                  <span className="tree-indent" style={{ width: `${depth * 20}px` }} aria-hidden="true" />
-                  {hasChildren ? (
-                    <button
-                      type="button"
-                      className="tree-toggle"
-                      aria-expanded={isExpanded}
-                      aria-label={isExpanded ? `${task.name} の子タスクを折りたたむ` : `${task.name} の子タスクを展開する`}
-                      onClick={() => onToggleExpanded(task.id, !isExpanded)}
-                    ><span className="tree-toggle-icon" aria-hidden="true" /></button>
-                  ) : (
-                    <span className="tree-toggle-spacer" aria-hidden="true" />
-                  )}
-                  <span className="tree-task-name">{task.name}</span>
-                </div>
+                {task.name}
               </td>
               <td>{masterName(task.categoryId)}</td>
               <td>{task.assigneeIds.map(masterName).join(", ")}</td>
@@ -318,9 +298,135 @@ const MasterTable = memo(function MasterTable({
   );
 });
 
+const DependencyMap = memo(function DependencyMap({
+  tasks,
+  masterName,
+  getMasterColor
+}: DependencyMapProps) {
+  const [mode, setMode] = useState<"overview" | "focus">("overview");
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+
+  const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
+
+  const childrenByParent = useMemo(() => {
+    const grouped = new Map<string, Task[]>();
+    for (const task of tasks) {
+      const parentId = task.dependencyTaskIds[0];
+      if (!parentId) {
+        continue;
+      }
+      const children = grouped.get(parentId) ?? [];
+      children.push(task);
+      grouped.set(parentId, children);
+    }
+    return grouped;
+  }, [tasks]);
+
+  const rootTasks = useMemo(
+    () => tasks.filter((task) => {
+      const parentId = task.dependencyTaskIds[0];
+      return !parentId || !taskById.has(parentId);
+    }),
+    [tasks, taskById]
+  );
+
+  const focusRootTasks = useMemo(
+    () => rootTasks.filter((task) => (childrenByParent.get(task.id) ?? []).length > 0),
+    [rootTasks, childrenByParent]
+  );
+
+  useEffect(() => {
+    if (!focusRootTasks.length) {
+      setSelectedTaskId("");
+      return;
+    }
+    if (!selectedTaskId || !focusRootTasks.some((task) => task.id === selectedTaskId)) {
+      setSelectedTaskId(focusRootTasks[0].id);
+    }
+  }, [focusRootTasks, selectedTaskId]);
+
+  const selectedRootTask = selectedTaskId ? taskById.get(selectedTaskId) : undefined;
+
+  const renderTaskCard = (task: Task, tone: "normal" | "primary" | "muted" = "normal") => (
+    <article className={`dependency-card dependency-card-${tone}`}>
+      <div className="dependency-card-header">
+        <strong>{task.name}</strong>
+        <span className="pill" style={{ "--pill-color": getMasterColor(task.statusId) } as CSSProperties}>
+          {masterName(task.statusId)}
+        </span>
+      </div>
+      <dl className="dependency-card-meta">
+        <div>
+          <dt>担当者</dt>
+          <dd>{task.assigneeIds.map(masterName).join(", ") || "-"}</dd>
+        </div>
+        <div>
+          <dt>期間</dt>
+          <dd>{task.startDate} - {task.dueDate}</dd>
+        </div>
+      </dl>
+    </article>
+  );
+
+  const renderTree = (task: Task, depth = 0, visited = new Set<string>()): ReactNode => {
+    const nextVisited = new Set(visited);
+    nextVisited.add(task.id);
+    const children = (childrenByParent.get(task.id) ?? []).filter((child) => !nextVisited.has(child.id));
+
+    return (
+      <div className="dependency-tree-node" style={{ "--tree-depth": depth } as CSSProperties} key={task.id}>
+        {renderTaskCard(task, depth === 0 ? "primary" : "normal")}
+        {children.length > 0 && (
+          <div className="dependency-tree-children">
+            {children.map((child) => renderTree(child, depth + 1, nextVisited))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <section className="dependency-map">
+      <div className="dependency-map-header">
+        <div>
+          <h2>依存マップ</h2>
+        </div>
+        <div className="segmented-control" aria-label="依存マップ表示">
+          <button className={mode === "overview" ? "active" : ""} onClick={() => setMode("overview")}>全体</button>
+          <button className={mode === "focus" ? "active" : ""} onClick={() => setMode("focus")}>選択中心</button>
+        </div>
+      </div>
+
+      {!tasks.length ? (
+        <p className="dependency-empty-state">表示できるタスクがありません。</p>
+      ) : mode === "overview" ? (
+        <div className="dependency-overview">
+          {(rootTasks.length ? rootTasks : tasks).map((task) => renderTree(task))}
+        </div>
+      ) : (
+        <div className="dependency-focus">
+          <label className="dependency-select">
+            対象タスク
+            <select value={selectedRootTask?.id ?? ""} onChange={(event) => setSelectedTaskId(event.target.value)}>
+              {focusRootTasks.map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}
+            </select>
+          </label>
+          {selectedRootTask ? (
+            <div className="dependency-focus-tree">
+              {renderTree(selectedRootTask)}
+            </div>
+          ) : (
+            <p className="dependency-empty-state">依存関係を持つ最上位タスクがありません。</p>
+          )}
+        </div>
+      )}
+    </section>
+  );
+});
+
 export default function App() {
   const [data, setData] = useState<AppData | null>(null);
-  const [activeTab, setActiveTab] = useState<"tasks" | "settings">("tasks");
+  const [activeTab, setActiveTab] = useState<"tasks" | "dependencies" | "settings">("tasks");
   const [editingTask, setEditingTask] = useState<Task>(blankTask());
   const [isTaskEditorCollapsed, setIsTaskEditorCollapsed] = useState(true);
   const [editingMaster, setEditingMaster] = useState<MasterItem>({
@@ -338,7 +444,6 @@ export default function App() {
   const [pathInput, setPathInput] = useState("");
   const [excelPath, setExcelPath] = useState("");
   const [message, setMessage] = useState("");
-  const [expandedTaskIds, setExpandedTaskIds] = useState<Record<string, boolean>>({});
 
   const masters = data?.masters ?? [];
   const tasks = data?.tasks ?? [];
@@ -416,54 +521,6 @@ export default function App() {
       );
     });
   }, [tasks, masterNameById, query, statusFilter, categoryFilter]);
-
-  const taskTreeRows = useMemo(() => {
-    const filteredTaskIds = new Set(filteredTasks.map((task) => task.id));
-    const childrenByParent = new Map<string, Task[]>();
-    const roots: Task[] = [];
-
-    for (const task of filteredTasks) {
-      const parentId = task.dependencyTaskIds[0];
-      if (parentId && filteredTaskIds.has(parentId)) {
-        const siblings = childrenByParent.get(parentId) ?? [];
-        siblings.push(task);
-        childrenByParent.set(parentId, siblings);
-      } else {
-        roots.push(task);
-      }
-    }
-
-    const rows: TaskTreeRow[] = [];
-    const visited = new Set<string>();
-
-    const visit = (task: Task, depth: number) => {
-      if (visited.has(task.id)) {
-        return;
-      }
-      visited.add(task.id);
-      const children = childrenByParent.get(task.id) ?? [];
-      const isExpanded = expandedTaskIds[task.id] ?? depth === 0;
-      rows.push({ task, depth, hasChildren: children.length > 0, isExpanded });
-      if (!isExpanded) {
-        return;
-      }
-      for (const child of children) {
-        visit(child, depth + 1);
-      }
-    };
-
-    for (const root of roots) {
-      visit(root, 0);
-    }
-
-    for (const task of filteredTasks) {
-      if (!visited.has(task.id)) {
-        visit(task, 0);
-      }
-    }
-
-    return rows;
-  }, [filteredTasks, expandedTaskIds]);
 
   async function refresh() {
     try {
@@ -644,10 +701,6 @@ export default function App() {
     }));
   }, []);
 
-  const toggleTaskExpanded = useCallback((taskId: string, nextExpanded: boolean) => {
-    setExpandedTaskIds((current) => ({ ...current, [taskId]: nextExpanded }));
-  }, []);
-
   const deleteTask = useCallback((taskId: string) => {
     void (async () => {
       try {
@@ -722,6 +775,7 @@ export default function App() {
 
       <nav className="tabs">
         <button className={activeTab === "tasks" ? "active" : ""} onClick={() => setActiveTab("tasks")}>タスク一覧</button>
+        <button className={activeTab === "dependencies" ? "active" : ""} onClick={() => setActiveTab("dependencies")}>依存マップ</button>
         <button className={activeTab === "settings" ? "active" : ""} onClick={() => setActiveTab("settings")}>設定</button>
       </nav>
 
@@ -750,7 +804,7 @@ export default function App() {
             statusFilter={statusFilter}
             categoryOptions={categoryOptions}
             statusOptions={statusOptions}
-            taskTreeRows={taskTreeRows}
+            tasks={filteredTasks}
             isEditing={isEditing}
             masterName={masterName}
             getMasterColor={getMasterColor}
@@ -758,11 +812,16 @@ export default function App() {
             onSetQuery={setQuery}
             onSetCategoryFilter={setCategoryFilter}
             onSetStatusFilter={setStatusFilter}
-            onToggleExpanded={toggleTaskExpanded}
             onEditTask={startTaskEdit}
             onDeleteTask={deleteTask}
           />
         </section>
+      ) : activeTab === "dependencies" ? (
+        <DependencyMap
+          tasks={tasks}
+          masterName={masterName}
+          getMasterColor={getMasterColor}
+        />
       ) : (
         <section className="settings">
           <MasterEditor
