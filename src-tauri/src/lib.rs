@@ -77,6 +77,7 @@ struct Task {
     notes: String,
     created_at: String,
     updated_at: String,
+    archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +124,7 @@ struct RawTaskImport {
     start_date: String,
     due_date: String,
     notes: String,
+    archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +149,7 @@ pub fn run() {
             acquire_lock,
             release_lock,
             save_task,
+            archive_task,
             delete_task,
             save_master,
             delete_master,
@@ -233,6 +236,9 @@ fn save_task(task: Task, state: State<'_, Mutex<AppStorage>>) -> AppResult<Task>
     validate_task(&storage.database_path, &task)?;
     let now = Utc::now().to_rfc3339();
     let mut task = task;
+    if !is_done_status(&storage.database_path, &task.status_id)? {
+        task.archived_at = None;
+    }
     if task.id.trim().is_empty() {
         task.id = new_id("task");
         task.created_at = now.clone();
@@ -244,8 +250,8 @@ fn save_task(task: Task, state: State<'_, Mutex<AppStorage>>) -> AppResult<Task>
 
     let conn = Connection::open(&storage.database_path)?;
     conn.execute(
-        "insert into tasks (id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "insert into tasks (id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at, archived_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          on conflict(id) do update set
            name=excluded.name,
            category_id=excluded.category_id,
@@ -256,7 +262,8 @@ fn save_task(task: Task, state: State<'_, Mutex<AppStorage>>) -> AppResult<Task>
            due_date=excluded.due_date,
            dependency_task_ids=excluded.dependency_task_ids,
            notes=excluded.notes,
-           updated_at=excluded.updated_at",
+           updated_at=excluded.updated_at,
+           archived_at=excluded.archived_at",
         params![
             task.id,
             task.name,
@@ -269,8 +276,37 @@ fn save_task(task: Task, state: State<'_, Mutex<AppStorage>>) -> AppResult<Task>
             serde_json::to_string(&task.dependency_task_ids)?,
             task.notes,
             task.created_at,
-            task.updated_at
+            task.updated_at,
+            task.archived_at
         ],
+    )?;
+    Ok(task)
+}
+
+#[tauri::command]
+fn archive_task(id: String, archived: bool, state: State<'_, Mutex<AppStorage>>) -> AppResult<Task> {
+    let storage = state.lock().map_err(|_| AppError::Message("アプリ状態を取得できません。".into()))?;
+    require_own_lock(&storage)?;
+    let data = read_app_data(&storage.database_path)?;
+    let masters = data.masters;
+    let mut task = data
+        .tasks
+        .into_iter()
+        .find(|task| task.id == id)
+        .ok_or_else(|| AppError::Message("タスクが見つかりません。".into()))?;
+
+    if archived && !is_done_task(&task, &masters) {
+        return Err(AppError::Message("完了したタスクだけをアーカイブできます。".into()));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    task.archived_at = if archived { Some(now.clone()) } else { None };
+    task.updated_at = now;
+
+    let conn = Connection::open(&storage.database_path)?;
+    conn.execute(
+        "update tasks set archived_at = ?1, updated_at = ?2 where id = ?3",
+        params![task.archived_at, task.updated_at, task.id],
     )?;
     Ok(task)
 }
@@ -388,7 +424,19 @@ fn ensure_database(path: &Path) -> AppResult<()> {
         );
         ",
     )?;
+    add_column_if_missing(&conn, "tasks", "archived_at", "text")?;
     seed_masters(&conn)?;
+    Ok(())
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, definition: &str) -> AppResult<()> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(&format!("alter table {table} add column {column} {definition}"), [])?;
+    }
     Ok(())
 }
 
@@ -437,7 +485,7 @@ fn read_app_data(path: &Path) -> AppResult<AppData> {
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut task_stmt = conn.prepare(
-        "select id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at
+        "select id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at, archived_at
          from tasks order by due_date, priority_id, name",
     )?;
     let tasks = task_stmt
@@ -457,6 +505,7 @@ fn read_app_data(path: &Path) -> AppResult<AppData> {
                 notes: row.get(9)?,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
+                archived_at: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -511,6 +560,22 @@ fn validate_task_against_tasks(existing_tasks: &[Task], task: &Task) -> AppResul
     }
     ensure_no_dependency_cycle(existing_tasks, task)?;
     Ok(())
+}
+
+fn is_done_status(path: &Path, status_id: &str) -> AppResult<bool> {
+    let data = read_app_data(path)?;
+    Ok(is_done_status_in_masters(status_id, &data.masters))
+}
+
+fn is_done_task(task: &Task, masters: &[MasterItem]) -> bool {
+    is_done_status_in_masters(&task.status_id, masters)
+}
+
+fn is_done_status_in_masters(status_id: &str, masters: &[MasterItem]) -> bool {
+    status_id == "status-done"
+        || masters
+            .iter()
+            .any(|master| master.kind == "status" && master.id == status_id && master.name == "完了")
 }
 
 fn ensure_no_dependency_cycle(existing_tasks: &[Task], task: &Task) -> AppResult<()> {
@@ -749,9 +814,9 @@ fn resolve_dependency_ids(
 
 fn upsert_task_record(conn: &Connection, task: &Task) -> AppResult<()> {
     conn.execute(
-        "insert into tasks (id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         on conflict(id) do update set name=excluded.name, category_id=excluded.category_id, assignee_ids=excluded.assignee_ids, status_id=excluded.status_id, priority_id=excluded.priority_id, start_date=excluded.start_date, due_date=excluded.due_date, dependency_task_ids=excluded.dependency_task_ids, notes=excluded.notes, updated_at=excluded.updated_at",
+        "insert into tasks (id, name, category_id, assignee_ids, status_id, priority_id, start_date, due_date, dependency_task_ids, notes, created_at, updated_at, archived_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         on conflict(id) do update set name=excluded.name, category_id=excluded.category_id, assignee_ids=excluded.assignee_ids, status_id=excluded.status_id, priority_id=excluded.priority_id, start_date=excluded.start_date, due_date=excluded.due_date, dependency_task_ids=excluded.dependency_task_ids, notes=excluded.notes, updated_at=excluded.updated_at, archived_at=excluded.archived_at",
         params![
             task.id,
             task.name,
@@ -764,7 +829,8 @@ fn upsert_task_record(conn: &Connection, task: &Task) -> AppResult<()> {
             serde_json::to_string(&task.dependency_task_ids)?,
             task.notes,
             task.created_at,
-            task.updated_at
+            task.updated_at,
+            task.archived_at
         ],
     )?;
     Ok(())
@@ -789,7 +855,8 @@ fn write_excel(path: &Path, tasks: &[Task], masters: &[MasterItem]) -> AppResult
         "優先度ID",
         "開始日",
         "期日",
-        "メモ"
+        "メモ",
+        "アーカイブ日時"
     ];
     for (col, header) in headers.iter().enumerate() {
         task_sheet.write_string(0, col as u16, *header)?;
@@ -826,6 +893,7 @@ fn write_excel(path: &Path, tasks: &[Task], masters: &[MasterItem]) -> AppResult
         task_sheet.write_string(row, 12, &task.start_date)?;
         task_sheet.write_string(row, 13, &task.due_date)?;
         task_sheet.write_string(row, 14, &task.notes)?;
+        task_sheet.write_string(row, 15, task.archived_at.as_deref().unwrap_or(""))?;
     }
 
     let master_sheet = workbook.add_worksheet();
@@ -899,6 +967,7 @@ fn import_excel_file(path: &Path, database_path: &Path) -> AppResult<ImportRepor
                 start_date: cell(row, 12).unwrap_or_default(),
                 due_date: cell(row, 13).unwrap_or_default(),
                 notes: cell(row, 14).unwrap_or_else(|| cell(row, 9).unwrap_or_default()),
+                archived_at: cell(row, 15).filter(|value| !value.trim().is_empty()),
             })
             .collect::<Vec<_>>();
 
@@ -951,6 +1020,7 @@ fn import_excel_file(path: &Path, database_path: &Path) -> AppResult<ImportRepor
                         notes: row.notes,
                         created_at: Utc::now().to_rfc3339(),
                         updated_at: Utc::now().to_rfc3339(),
+                        archived_at: row.archived_at,
                     },
                 }
             })

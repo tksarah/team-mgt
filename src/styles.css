@@ -308,10 +308,16 @@ legend {
 
 .filters {
   display: grid;
-  grid-template-columns: 1fr 180px 180px;
+  grid-template-columns: 1fr 180px 180px auto;
   gap: 10px;
   padding: 14px;
   border-bottom: 1px solid var(--line);
+  align-items: center;
+}
+
+.filter-check {
+  align-self: center;
+  white-space: nowrap;
 }
 
 table {
@@ -336,6 +342,28 @@ td {
 
 tbody tr:hover {
   background: #f8fbff;
+}
+
+.archived-row {
+  background: #f8fafc;
+  color: #667085;
+}
+
+.archived-row:hover {
+  background: #f1f5f9;
+}
+
+.archive-badge {
+  display: inline-block;
+  margin-left: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: #eef2f6;
+  color: #475467;
+  font-size: 11px;
+  font-weight: 700;
+  vertical-align: 1px;
 }
 
 .pill {

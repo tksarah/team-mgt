@@ -27,6 +27,7 @@ type Task = {
   notes: string;
   createdAt: string;
   updatedAt: string;
+  archivedAt: string | null;
 };
 
 type LockState = {
@@ -70,6 +71,7 @@ type TaskTableProps = {
   query: string;
   categoryFilter: string;
   statusFilter: string;
+  showArchived: boolean;
   categoryOptions: MasterItem[];
   statusOptions: MasterItem[];
   tasks: Task[];
@@ -80,7 +82,9 @@ type TaskTableProps = {
   onSetQuery: (value: string) => void;
   onSetCategoryFilter: (value: string) => void;
   onSetStatusFilter: (value: string) => void;
+  onSetShowArchived: (value: boolean) => void;
   onEditTask: (task: Task) => void;
+  onArchiveTask: (taskId: string, archived: boolean) => void;
   onDeleteTask: (taskId: string) => void;
 };
 
@@ -116,7 +120,8 @@ const blankTask = (): Task => ({
   dependencyTaskIds: [],
   notes: "",
   createdAt: "",
-  updatedAt: ""
+  updatedAt: "",
+  archivedAt: null
 });
 
 const kindLabels: Record<MasterKind, string> = {
@@ -202,6 +207,7 @@ const TaskTable = memo(function TaskTable({
   query,
   categoryFilter,
   statusFilter,
+  showArchived,
   categoryOptions,
   statusOptions,
   tasks,
@@ -212,7 +218,9 @@ const TaskTable = memo(function TaskTable({
   onSetQuery,
   onSetCategoryFilter,
   onSetStatusFilter,
+  onSetShowArchived,
   onEditTask,
+  onArchiveTask,
   onDeleteTask
 }: TaskTableProps) {
   return (
@@ -221,14 +229,19 @@ const TaskTable = memo(function TaskTable({
         <input value={query} onChange={(event) => onSetQuery(event.target.value)} placeholder="検索" />
         <select value={categoryFilter} onChange={(event) => onSetCategoryFilter(event.target.value)}><option value="">全カテゴリ</option>{categoryOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
         <select value={statusFilter} onChange={(event) => onSetStatusFilter(event.target.value)}><option value="">全ステータス</option>{statusOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+        <label className="check filter-check"><input type="checkbox" checked={showArchived} onChange={(event) => onSetShowArchived(event.target.checked)} />アーカイブを表示</label>
       </div>
       <table>
         <thead><tr><th>タスク名</th><th>カテゴリ</th><th>担当者</th><th>ステータス</th><th>優先度</th><th>期間</th><th>メモ</th><th>依存</th><th></th></tr></thead>
         <tbody>
-          {tasks.map((task) => (
-            <tr key={task.id}>
+          {tasks.map((task) => {
+            const isArchived = Boolean(task.archivedAt);
+            const canArchive = !isArchived && (task.statusId === "status-done" || masterName(task.statusId) === "完了");
+            return (
+            <tr key={task.id} className={isArchived ? "archived-row" : undefined}>
               <td>
                 {task.name}
+                {isArchived && <span className="archive-badge">アーカイブ済</span>}
               </td>
               <td>{masterName(task.categoryId)}</td>
               <td>{task.assigneeIds.map(masterName).join(", ")}</td>
@@ -239,10 +252,16 @@ const TaskTable = memo(function TaskTable({
               <td>{task.dependencyTaskIds.map((id) => taskNameById.get(id) ?? id).join(", ")}</td>
               <td className="actions">
                 <button onClick={() => onEditTask(task)}>編集</button>
+                {isArchived ? (
+                  <button disabled={!isEditing} onClick={() => onArchiveTask(task.id, false)}>復元</button>
+                ) : canArchive ? (
+                  <button disabled={!isEditing} onClick={() => onArchiveTask(task.id, true)}>アーカイブ</button>
+                ) : null}
                 <button disabled={!isEditing} onClick={() => onDeleteTask(task.id)}>削除</button>
               </td>
             </tr>
-          ))}
+          );
+          })}
         </tbody>
       </table>
     </section>
@@ -441,6 +460,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
   const [pathInput, setPathInput] = useState("");
   const [excelPath, setExcelPath] = useState("");
   const [message, setMessage] = useState("");
@@ -496,9 +516,18 @@ export default function App() {
     return color && /^#[0-9a-f]{6}$/i.test(color) ? color : "#2563eb";
   }, [masterColorById]);
 
+  const activeTasks = useMemo(() => tasks.filter((task) => !task.archivedAt), [tasks]);
+
+  const dependencyMapTasks = activeTasks;
+
   const dependencyOptions = useMemo(
-    () => tasks.filter((task) => task.id !== editingTask.id),
-    [tasks, editingTask.id]
+    () => tasks.filter((task) => {
+      if (task.id === editingTask.id) {
+        return false;
+      }
+      return !task.archivedAt || editingTask.dependencyTaskIds.includes(task.id);
+    }),
+    [tasks, editingTask.id, editingTask.dependencyTaskIds]
   );
 
   const filteredTasks = useMemo(() => {
@@ -515,12 +544,13 @@ export default function App() {
         .join(" ")
         .toLowerCase();
       return (
+        (showArchived || !task.archivedAt) &&
         (!lowerQuery || haystack.includes(lowerQuery)) &&
         (!statusFilter || task.statusId === statusFilter) &&
         (!categoryFilter || task.categoryId === categoryFilter)
       );
     });
-  }, [tasks, masterNameById, query, statusFilter, categoryFilter]);
+  }, [tasks, masterNameById, query, statusFilter, categoryFilter, showArchived]);
 
   async function refresh() {
     try {
@@ -713,6 +743,19 @@ export default function App() {
     })();
   }, [updateTasks]);
 
+  const archiveTask = useCallback((taskId: string, archived: boolean) => {
+    void (async () => {
+      try {
+        const savedTask = await invoke<Task>("archive_task", { id: taskId, archived });
+        updateTasks((current) => upsertById(current, savedTask));
+        setEditingTask((current) => (current.id === savedTask.id ? savedTask : current));
+        setMessage(archived ? "タスクをアーカイブしました。" : "タスクを復元しました。");
+      } catch (error) {
+        setMessage(String(error));
+      }
+    })();
+  }, [updateTasks]);
+
   const deleteMaster = useCallback((masterId: string) => {
     void (async () => {
       try {
@@ -802,6 +845,7 @@ export default function App() {
             query={query}
             categoryFilter={categoryFilter}
             statusFilter={statusFilter}
+            showArchived={showArchived}
             categoryOptions={categoryOptions}
             statusOptions={statusOptions}
             tasks={filteredTasks}
@@ -812,13 +856,15 @@ export default function App() {
             onSetQuery={setQuery}
             onSetCategoryFilter={setCategoryFilter}
             onSetStatusFilter={setStatusFilter}
+            onSetShowArchived={setShowArchived}
             onEditTask={startTaskEdit}
+            onArchiveTask={archiveTask}
             onDeleteTask={deleteTask}
           />
         </section>
       ) : activeTab === "dependencies" ? (
         <DependencyMap
-          tasks={tasks}
+          tasks={dependencyMapTasks}
           masterName={masterName}
           getMasterColor={getMasterColor}
         />
