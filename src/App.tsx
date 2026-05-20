@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, type CSSProperties, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
@@ -82,6 +82,7 @@ type TaskTableProps = {
   taskTreeRows: TaskTreeRow[];
   isEditing: boolean;
   masterName: (id: string) => string;
+  getMasterColor: (id: string) => string;
   taskNameById: Map<string, string>;
   onSetQuery: (value: string) => void;
   onSetCategoryFilter: (value: string) => void;
@@ -208,6 +209,7 @@ const TaskTable = memo(function TaskTable({
   taskTreeRows,
   isEditing,
   masterName,
+  getMasterColor,
   taskNameById,
   onSetQuery,
   onSetCategoryFilter,
@@ -250,7 +252,7 @@ const TaskTable = memo(function TaskTable({
               </td>
               <td>{masterName(task.categoryId)}</td>
               <td>{task.assigneeIds.map(masterName).join(", ")}</td>
-              <td><span className="pill">{masterName(task.statusId)}</span></td>
+              <td><span className="pill" style={{ "--pill-color": getMasterColor(task.statusId) } as CSSProperties}>{masterName(task.statusId)}</span></td>
               <td>{masterName(task.priorityId)}</td>
               <td>{task.startDate} - {task.dueDate}</td>
               <td className="memo-preview" title={task.notes}>{previewNotes(task.notes)}</td>
@@ -374,6 +376,7 @@ export default function App() {
   }, [masters]);
 
   const masterNameById = useMemo(() => new Map(masters.map((item) => [item.id, item.name])), [masters]);
+  const masterColorById = useMemo(() => new Map(masters.map((item) => [item.id, item.color])), [masters]);
 
   const taskNameById = useMemo(() => new Map(tasks.map((task) => [task.id, task.name])), [tasks]);
 
@@ -383,6 +386,10 @@ export default function App() {
   const priorityOptions = mastersByKind.priority;
 
   const masterName = useCallback((id: string) => masterNameById.get(id) ?? id, [masterNameById]);
+  const getMasterColor = useCallback((id: string) => {
+    const color = masterColorById.get(id);
+    return color && /^#[0-9a-f]{6}$/i.test(color) ? color : "#2563eb";
+  }, [masterColorById]);
 
   const dependencyOptions = useMemo(
     () => tasks.filter((task) => task.id !== editingTask.id),
@@ -746,6 +753,7 @@ export default function App() {
             taskTreeRows={taskTreeRows}
             isEditing={isEditing}
             masterName={masterName}
+            getMasterColor={getMasterColor}
             taskNameById={taskNameById}
             onSetQuery={setQuery}
             onSetCategoryFilter={setCategoryFilter}

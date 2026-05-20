@@ -354,8 +354,10 @@ tbody tr.tree-row-expanded:hover {
 .pill {
   display: inline-block;
   border-radius: 999px;
+  border: 1px solid var(--pill-color, #1d4ed8);
   background: #e0edff;
-  color: #1d4ed8;
+  background: color-mix(in srgb, var(--pill-color, #1d4ed8) 14%, #ffffff);
+  color: var(--pill-color, #1d4ed8);
   padding: 3px 8px;
   font-weight: 700;
 }
